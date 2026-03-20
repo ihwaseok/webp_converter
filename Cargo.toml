@@ -1,0 +1,15 @@
+[package]
+name = "img-converter-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27.2"
+rfd = "0.12"
+image = "0.24"
+webp = "0.2"
+infer = "0.15"
+rayon = "1.8"
+anyhow = "1.0"
+walkdir = "2.4"
+tokio = { version = "1.32", features = ["full"] }
