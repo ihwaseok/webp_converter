@@ -50,9 +50,15 @@ impl ConverterApp {
                         
                         self.image_files.push(entry.path().to_path_buf());
                         self.total_original_size += size;
-                        
-                        let relative_path = entry.path().strip_prefix(path).unwrap_or(entry.path());
-                        self.add_log(format!("발견({}): {} ({})", kind, relative_path.to_string_lossy(), Self::format_size(size)));
+
+                        // 100만 개 발견 로그를 모두 저장하면 수백 MB 메모리 낭비
+                        // → 처음 1000개만 로그에 기록
+                        if self.image_files.len() <= 1000 {
+                            let relative_path = entry.path().strip_prefix(path).unwrap_or(entry.path());
+                            self.add_log(format!("발견({}): {} ({})", kind, relative_path.to_string_lossy(), Self::format_size(size)));
+                        } else if self.image_files.len() == 1001 {
+                            self.add_log("... (이후 파일은 목록 생략)".to_string());
+                        }
                     }
                 }
             }
@@ -87,16 +93,26 @@ impl ConverterApp {
         let counter = Arc::clone(&self.completed_count);
         
         std::thread::spawn(move || {
-            files.par_iter().for_each(|path| {
-                match converter::convert_to_webp(path) {
-                    Ok(out) => {
-                        logs.lock().unwrap().push(format!("대체 완료: {}", out.file_name().unwrap().to_string_lossy()));
-                    }
-                    Err(e) => {
-                        logs.lock().unwrap().push(format!("오류 발생({}): {}", path.file_name().unwrap().to_string_lossy(), e));
-                    }
-                }
-                counter.fetch_add(1, Ordering::SeqCst);
+            // HDD는 헤드가 하나라 동시 접근이 많으면 seek 비용이 폭발적으로 증가.
+            // 2~4 스레드가 HDD 순차 처리 대비 최적. SSD면 num_cpus로 바꿔도 됨.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap();
+
+            pool.install(|| {
+                // par_iter().map()으로 결과를 모아 한 번에 logs에 push → Mutex 경합 제거
+                let results: Vec<String> = files.par_iter().map(|path| {
+                    let result = match converter::convert_to_webp(path) {
+                        Ok(out) => format!("완료: {}", out.file_name().unwrap().to_string_lossy()),
+                        Err(e) => format!("오류({}): {}", path.file_name().unwrap().to_string_lossy(), e),
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    result
+                }).collect();
+
+                // 변환 완료 후 한 번만 락 → 100만 번 락/언락 → 1번으로 감소
+                logs.lock().unwrap().extend(results);
             });
         });
         
@@ -156,7 +172,13 @@ impl eframe::App for ConverterApp {
             
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                 let logs = self.logs.lock().unwrap();
-                for log in logs.iter() {
+                // 전체 로그를 매 프레임 렌더링하면 100만 항목에서 UI가 멈춤
+                // → 최근 500개만 표시
+                let start = logs.len().saturating_sub(500);
+                if start > 0 {
+                    ui.weak(format!("... ({}개 생략됨, 최근 500개 표시)", start));
+                }
+                for log in &logs[start..] {
                     ui.label(log);
                 }
             });
