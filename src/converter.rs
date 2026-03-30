@@ -30,6 +30,15 @@ pub fn convert_to_webp(source: &Path) -> Result<PathBuf> {
         return convert_gif_to_webp(source, &bytes);
     }
 
+    // WebP magic bytes: "RIFF....WEBP" — 정적/애니메이션 모두 reencode_webp에서 처리
+    let is_webp = bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && &bytes[8..12] == b"WEBP";
+
+    if is_webp {
+        return reencode_webp(source, &bytes);
+    }
+
     let img = image::load_from_memory(&bytes)?;
     let (_width, _height) = img.dimensions();
     let encoder = Encoder::from_image(&img)
@@ -42,6 +51,45 @@ pub fn convert_to_webp(source: &Path) -> Result<PathBuf> {
         fs::remove_file(source)?;
     }
     Ok(target_path)
+}
+
+fn reencode_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let decoder = webp::AnimDecoder::new(bytes);
+    let decoded = decoder.decode()
+        .map_err(|e| anyhow!("WebP 디코딩 실패: {}", e))?;
+
+    if decoded.has_animation() {
+        // 애니메이션 WebP → 프레임 타임스탬프를 그대로 유지하며 재인코딩
+        let first = decoded.get_frame(0)
+            .ok_or_else(|| anyhow!("WebP 프레임 없음"))?;
+
+        let config = webp::WebPConfig::new()
+            .map_err(|_| anyhow!("WebPConfig 생성 실패"))?;
+        let mut enc = webp::AnimEncoder::new(first.width(), first.height(), &config);
+
+        // AnimFrame이 픽셀 데이터를 참조로 저장하므로, 데이터를 먼저 수집해 수명을 보장
+        let frames_data: Vec<(Vec<u8>, u32, u32, i32)> = (0..decoded.len())
+            .filter_map(|i| decoded.get_frame(i))
+            .map(|f| (f.get_image().to_vec(), f.width(), f.height(), f.get_time_ms() as i32))
+            .collect();
+
+        for (rgba, w, h, ts) in &frames_data {
+            enc.add_frame(webp::AnimFrame::from_rgba(rgba, *w, *h, *ts));
+        }
+
+        let webp_data = enc.try_encode()
+            .map_err(|e| anyhow!("애니메이션 WebP 인코딩 실패: {:?}", e))?;
+        fs::write(source, &*webp_data)?;
+    } else {
+        // 정적 WebP → quality 75로 재인코딩
+        let img = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)?;
+        let encoder = Encoder::from_image(&img)
+            .map_err(|e| anyhow!("WebP 인코더 생성 실패: {}", e))?;
+        let webp_data = encoder.encode(75.0);
+        fs::write(source, &*webp_data)?;
+    }
+
+    Ok(source.to_path_buf())
 }
 
 fn convert_gif_to_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
