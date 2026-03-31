@@ -53,6 +53,16 @@ pub fn convert_to_webp(source: &Path) -> Result<PathBuf> {
     Ok(target_path)
 }
 
+fn calculate_new_dimensions(w: u32, h: u32) -> (u32, u32) {
+    if w > 800 {
+        let ratio = 800.0 / w as f64;
+        let new_h = (h as f64 * ratio).round() as u32;
+        (800, new_h)
+    } else {
+        (w, h)
+    }
+}
+
 fn reencode_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let decoder = webp::AnimDecoder::new(bytes);
     let decoded = decoder.decode()
@@ -63,14 +73,28 @@ fn reencode_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
         let first = decoded.get_frame(0)
             .ok_or_else(|| anyhow!("WebP 프레임 없음"))?;
 
-        let config = webp::WebPConfig::new()
+        let (n_width, n_height) = calculate_new_dimensions(first.width(), first.height());
+
+        let mut config = webp::WebPConfig::new()
             .map_err(|_| anyhow!("WebPConfig 생성 실패"))?;
-        let mut enc = webp::AnimEncoder::new(first.width(), first.height(), &config);
+        config.quality = 75.0;
+        config.method = 4; // 인코딩 방식 최적화
+
+        let mut enc = webp::AnimEncoder::new(n_width, n_height, &config);
 
         // AnimFrame이 픽셀 데이터를 참조로 저장하므로, 데이터를 먼저 수집해 수명을 보장
         let frames_data: Vec<(Vec<u8>, u32, u32, i32)> = (0..decoded.len())
             .filter_map(|i| decoded.get_frame(i))
-            .map(|f| (f.get_image().to_vec(), f.width(), f.height(), f.get_time_ms() as i32))
+            .map(|f| {
+                let (fw, fh) = (f.width(), f.height());
+                if fw > 800 {
+                    let img = image::RgbaImage::from_raw(fw, fh, f.get_image().to_vec()).unwrap();
+                    let resized = image::imageops::resize(&img, n_width, n_height, image::imageops::FilterType::Lanczos3);
+                    (resized.into_raw(), n_width, n_height, f.get_time_ms() as i32)
+                } else {
+                    (f.get_image().to_vec(), fw, fh, f.get_time_ms() as i32)
+                }
+            })
             .collect();
 
         for (rgba, w, h, ts) in &frames_data {
@@ -116,28 +140,35 @@ fn convert_gif_to_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
 
     // 애니메이션 GIF → 애니메이션 WebP
     let (width, height) = frames[0].buffer().dimensions();
+    let (n_width, n_height) = calculate_new_dimensions(width, height);
 
-    // AnimEncoder::new(w, h, &config) — AnimEncoderOptions 없음
-    let config = webp::WebPConfig::new()
+    let mut config = webp::WebPConfig::new()
         .map_err(|_| anyhow!("WebPConfig 생성 실패"))?;
-    let mut enc = webp::AnimEncoder::new(width, height, &config);
+    config.quality = 75.0;
+    config.method = 4; // 인코딩 방식 최적화
+
+    let mut enc = webp::AnimEncoder::new(n_width, n_height, &config);
 
     let mut timestamp_ms: i32 = 0;
-
-    for frame in &frames {
+    let frames_data: Vec<(Vec<u8>, u32, u32, i32)> = frames.iter().map(|frame| {
         let rgba = frame.buffer();
         let (fw, fh) = rgba.dimensions();
 
-        // image::Delay::numer_denom_ms() → delay = numer/denom (ms 단위)
         let (num, den) = frame.delay().numer_denom_ms();
         let delay_ms = ((num as f64 / den as f64).round() as i32).max(20);
-
-        // from_rgba: Result 아닌 AnimFrame 직접 반환
-        let anim_frame = webp::AnimFrame::from_rgba(rgba.as_raw(), fw, fh, timestamp_ms);
-        // add_frame: () 반환
-        enc.add_frame(anim_frame);
-
+        let current_ts = timestamp_ms;
         timestamp_ms += delay_ms;
+
+        if width > 800 {
+            let resized = image::imageops::resize(rgba, n_width, n_height, image::imageops::FilterType::Lanczos3);
+            (resized.into_raw(), n_width, n_height, current_ts)
+        } else {
+            (rgba.as_raw().to_vec(), fw, fh, current_ts)
+        }
+    }).collect();
+
+    for (rgba, w, h, ts) in &frames_data {
+        enc.add_frame(webp::AnimFrame::from_rgba(rgba, *w, *h, *ts));
     }
 
     let webp_data = enc.try_encode()
