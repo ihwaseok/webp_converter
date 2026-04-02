@@ -54,10 +54,12 @@ pub fn convert_to_webp(source: &Path) -> Result<PathBuf> {
 }
 
 fn calculate_new_dimensions(w: u32, h: u32) -> (u32, u32) {
-    if w > 640 {
-        let ratio = 640.0 / w as f64;
+    let max_dim = w.max(h);
+    if max_dim > 640 {
+        let ratio = 640.0 / max_dim as f64;
+        let new_w = (w as f64 * ratio).round() as u32;
         let new_h = (h as f64 * ratio).round() as u32;
-        (640, new_h)
+        (new_w, new_h)
     } else {
         (w, h)
     }
@@ -87,7 +89,7 @@ fn reencode_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
             .filter_map(|i| decoded.get_frame(i))
             .map(|f| {
                 let (fw, fh) = (f.width(), f.height());
-                if fw > 640 {
+                if fw > 640 || fh > 640 {
                     let img = image::RgbaImage::from_raw(fw, fh, f.get_image().to_vec()).unwrap();
                     let resized = image::imageops::resize(&img, n_width, n_height, image::imageops::FilterType::Lanczos3);
                     (resized.into_raw(), n_width, n_height, f.get_time_ms() as i32)
@@ -159,7 +161,7 @@ fn convert_gif_to_webp(source: &Path, bytes: &[u8]) -> Result<PathBuf> {
         let current_ts = timestamp_ms;
         timestamp_ms += delay_ms;
 
-        if width > 640 {
+        if width > 640 || height > 640 {
             let resized = image::imageops::resize(rgba, n_width, n_height, image::imageops::FilterType::Lanczos3);
             (resized.into_raw(), n_width, n_height, current_ts)
         } else {
